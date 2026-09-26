@@ -293,6 +293,12 @@
     <button class="btn-swap" id="swapBtn">⇄ Richtung tauschen</button>
   </div>
 
+  <div class="controls">
+    <button class="btn-locate" id="testBahnDeBtn">🧪 bahn.de direkt testen (CORS-Check)</button>
+  </div>
+
+  <div id="testResult" style="font-size:12px;color:var(--text-dim);margin-top:6px;white-space:pre-line;"></div>
+
   <div class="list" id="list">
     <div class="loading">Verbindungen werden geladen …</div>
   </div>
@@ -309,8 +315,8 @@
   // Mehrere Endpunkte, da die offizielle API zeitweise instabil/down sein kann.
   // Die App probiert sie der Reihe nach durch und merkt sich, welche funktioniert hat.
   const API_BASES = [
-    "https://v6.db.transport.rest",
-    "https://db.emmabyte.de"
+    "https://db.emmabyte.de",
+    "https://v6.db.transport.rest"
   ];
   const WINDOW_MIN = 60;       // Zeitfenster in Minuten
   const REFRESH_MS = 30000;    // Auto-Refresh Intervall
@@ -601,6 +607,37 @@
   });
 
   el.locateBtn.addEventListener("click", tryGeolocate);
+
+  document.getElementById("testBahnDeBtn").addEventListener("click", async () => {
+    const out = document.getElementById("testResult");
+    out.style.color = "var(--text-dim)";
+    out.textContent = "teste www.bahn.de/web/api …";
+    const url = "https://www.bahn.de/web/api/reiseloesung/orte?suchbegriff=Saarbr%C3%BCcken%20Hbf&typ=ALL&limit=3";
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await fetch(url, { signal: controller.signal, mode: "cors", cache: "no-store" });
+      clearTimeout(timer);
+      if (!res.ok) {
+        out.style.color = "var(--red)";
+        out.textContent = "❌ Antwort kam an, aber mit Fehler: HTTP " + res.status + " " + res.statusText;
+        return;
+      }
+      const data = await res.json();
+      out.style.color = "var(--green)";
+      out.textContent = "✅ Es funktioniert! bahn.de liefert direkt Daten:\n" + JSON.stringify(data, null, 2).slice(0, 800);
+      console.log("bahn.de Testantwort (vollständig):", data);
+    } catch (err) {
+      clearTimeout(timer);
+      out.style.color = "var(--red)";
+      if (err.name === "AbortError") {
+        out.textContent = "❌ Zeitüberschreitung nach 8s – keine Antwort von bahn.de.";
+      } else {
+        out.textContent = "❌ Fehlgeschlagen: " + err.name + ": " + err.message +
+          "\nDas ist fast sicher eine CORS-Blockade – bahn.de lässt direkte Anfragen von fremden Webseiten wie dieser nicht zu.";
+      }
+    }
+  });
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
