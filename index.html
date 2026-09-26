@@ -530,7 +530,8 @@
           cancelled,
           lineName,
           arrival: null,
-          transfers: 0
+          transfers: 0,
+          raw: item
         };
       })
       .filter(Boolean)
@@ -647,6 +648,28 @@
         </div>
       `;
       el.list.appendChild(row);
+    }
+
+    if (journeys[0] && journeys[0].raw) {
+      const dbg = document.createElement("details");
+      dbg.style.marginTop = "8px";
+      dbg.style.fontSize = "11px";
+      dbg.style.color = "var(--text-dim)";
+      const summary = document.createElement("summary");
+      summary.textContent = "🔍 Rohdaten (für Debug – zum Kopieren antippen & senden)";
+      summary.style.cursor = "pointer";
+      dbg.appendChild(summary);
+      const pre = document.createElement("pre");
+      pre.style.whiteSpace = "pre-wrap";
+      pre.style.wordBreak = "break-word";
+      pre.style.background = "var(--panel)";
+      pre.style.border = "1px solid var(--line)";
+      pre.style.borderRadius = "8px";
+      pre.style.padding = "10px";
+      pre.style.marginTop = "6px";
+      pre.textContent = JSON.stringify(journeys[0].raw, null, 2);
+      dbg.appendChild(pre);
+      el.list.appendChild(dbg);
     }
   }
 
