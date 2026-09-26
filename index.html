@@ -293,18 +293,22 @@
     <button class="btn-swap" id="swapBtn">⇄ Richtung tauschen</button>
   </div>
 
-  <div class="controls">
-    <button class="btn-locate" id="testBahnDeBtn">🧪 bahn.de direkt testen (CORS-Check)</button>
+  <div class="route" style="padding:14px 16px; margin-top:10px;">
+    <div class="section-label" style="margin:0 0 8px;">⚙️ Eigener Proxy (optional, aber empfohlen)</div>
+    <div style="display:flex; gap:8px;">
+      <input id="proxyInput" type="url" placeholder="https://dein-worker.workers.dev"
+        style="flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); color:var(--text); border-radius:10px; padding:10px 12px; font-size:13px; font-family:inherit;">
+      <button id="proxySaveBtn">Speichern</button>
+    </div>
+    <div id="proxyStatus" style="font-size:12px; color:var(--text-dim); margin-top:8px; white-space:pre-line;"></div>
   </div>
-
-  <div id="testResult" style="font-size:12px;color:var(--text-dim);margin-top:6px;white-space:pre-line;"></div>
 
   <div class="list" id="list">
     <div class="loading">Verbindungen werden geladen …</div>
   </div>
 
   <footer>
-    Daten: v6.db.transport.rest (bahn.de) · Auto-Update alle 30&nbsp;s
+    Daten: bahn.de (über eigenen Proxy) mit Fallback auf öffentliche Spiegel · Auto-Update alle 30&nbsp;s
   </footer>
 </div>
 
@@ -312,8 +316,8 @@
 (function () {
   "use strict";
 
-  // Mehrere Endpunkte, da die offizielle API zeitweise instabil/down sein kann.
-  // Die App probiert sie der Reihe nach durch und merkt sich, welche funktioniert hat.
+  // Fallback-Endpunkte (Community-Spiegel), falls kein eigener Proxy
+  // eingerichtet ist oder dieser gerade nicht erreichbar ist.
   const API_BASES = [
     "https://db.emmabyte.de",
     "https://v6.db.transport.rest"
@@ -324,8 +328,8 @@
   // Referenzkoordinaten zum eindeutigen Auflösen der Stationen
   // (verhindert Verwechslung z.B. mit "Dillingen (Donau)")
   const STATIONS = {
-    sb: { key: "sb", label: "Saarbrücken Hbf",  query: "Saarbrücken Hbf",   lat: 49.2414,  lon: 6.9906,  id: null },
-    dl: { key: "dl", label: "Dillingen (Saar)",  query: "Dillingen (Saar)", lat: 49.35263, lon: 6.72258, id: null }
+    sb: { key: "sb", label: "Saarbrücken Hbf",  query: "Saarbrücken Hbf",   lat: 49.2414,  lon: 6.9906,  id: null, bahnde: null },
+    dl: { key: "dl", label: "Dillingen (Saar)",  query: "Dillingen (Saar)", lat: 49.35263, lon: 6.72258, id: null, bahnde: null }
   };
 
   let direction = localStorage.getItem("direction") || "sb-dl"; // "sb-dl" oder "dl-sb"
@@ -428,9 +432,128 @@
     localStorage.setItem("stationId:" + station.key, best.id);
   }
 
+  // ---------- Proxy-Einstellungen ----------
+
+  function getProxyBase() {
+    const v = (localStorage.getItem("proxyBase") || "").trim();
+    return v ? v.replace(/\/+$/, "") : "";
+  }
+
+  function pad2(n) { return String(n).padStart(2, "0"); }
+  function localDatum(d) { return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()); }
+  function localZeit(d) { return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds()); }
+
+  // ---------- bahn.de über eigenen Proxy (primäre Quelle, falls konfiguriert) ----------
+
+  async function resolveStationBahnDe(proxyBase, station) {
+    const cacheKey = "bahndeId:" + station.key;
+    const cached = localStorage.getItem(cacheKey);
+    if (cached) {
+      station.bahnde = JSON.parse(cached);
+      return;
+    }
+    const path = `/web/api/reiseloesung/orte?suchbegriff=${encodeURIComponent(station.query)}&typ=ALL&limit=6`;
+    const data = await fetchOnce(proxyBase + path, 8000);
+    const arr = Array.isArray(data) ? data : (data.orte || data.results || Object.values(data).find(v => Array.isArray(v)) || []);
+    if (!arr || !arr.length) throw new Error("bahn.de (Proxy): Station nicht gefunden – " + station.label);
+
+    let best = null, bestDist = Infinity;
+    for (const s of arr) {
+      const lat = s.lat ?? s.latitude ?? (s.coordinates && s.coordinates.lat);
+      const lon = s.lon ?? s.lng ?? s.longitude ?? (s.coordinates && s.coordinates.lng);
+      if (lat == null || lon == null) continue;
+      const d = haversine(station.lat, station.lon, lat, lon);
+      if (d < bestDist) { bestDist = d; best = s; }
+    }
+    if (!best) best = arr[0];
+
+    const extId = best.extId || best.evaNr || best.ortExtId;
+    const ortId = best.id || best.ortId;
+    if (!extId || !ortId) {
+      throw new Error("bahn.de (Proxy): Unerwartetes Antwortformat bei der Stationssuche.\n" + JSON.stringify(best).slice(0, 300));
+    }
+    station.bahnde = { extId: String(extId), ortId: String(ortId), name: best.name || station.label };
+    localStorage.setItem(cacheKey, JSON.stringify(station.bahnde));
+  }
+
+  async function fetchJourneysViaProxy(proxyBase, fromStation, toStation) {
+    await Promise.all([
+      resolveStationBahnDe(proxyBase, fromStation),
+      resolveStationBahnDe(proxyBase, toStation)
+    ]);
+
+    const now = new Date();
+    const path = `/web/api/reiseloesung/abfahrten?datum=${localDatum(now)}&zeit=${encodeURIComponent(localZeit(now))}` +
+      `&ortExtId=${encodeURIComponent(fromStation.bahnde.extId)}&ortId=${encodeURIComponent(fromStation.bahnde.ortId)}` +
+      `&mitVias=true&maxVias=8`;
+    const data = await fetchOnce(proxyBase + path, 8000);
+    const arr = Array.isArray(data) ? data : (data.entries || data.abfahrten || Object.values(data).find(v => Array.isArray(v)) || null);
+    if (!Array.isArray(arr)) {
+      throw new Error("bahn.de (Proxy): Unerwartetes Antwortformat bei den Abfahrten.\n" + JSON.stringify(data).slice(0, 300));
+    }
+
+    // Da der genaue Feldname für Zwischenhalte unsicher ist, wird der komplette
+    // Datensatz als Text durchsucht: robust gegen unbekannte Feldnamen.
+    const targetNames = [toStation.bahnde.name, toStation.label, toStation.label.replace(" (Saar)", "")].filter(Boolean);
+    const windowEnd = new Date(now.getTime() + WINDOW_MIN * 60000);
+
+    return arr
+      .map(item => {
+        const raw = JSON.stringify(item);
+        if (!targetNames.some(n => raw.includes(n))) return null;
+
+        const plannedRaw = item.zeit || item.plannedWhen || item.abfahrtszeit || item.planned;
+        const realRaw = item.ezZeit || item.ezAbfahrtszeit || item.realZeit || item.when || plannedRaw;
+        if (!plannedRaw) return null;
+        const plannedDeparture = new Date(plannedRaw);
+        const departure = new Date(realRaw || plannedRaw);
+        if (isNaN(departure.getTime())) return null;
+
+        let delaySec = null;
+        if (typeof item.verspaetung === "number") {
+          delaySec = item.verspaetung * 60;
+        } else if (!isNaN(plannedDeparture.getTime())) {
+          const diff = Math.round((departure - plannedDeparture) / 1000);
+          if (diff !== 0) delaySec = diff;
+        }
+
+        const vm = item.verkehrsmittel || {};
+        const lineName = vm.kurzText || vm.name || item.linienbezeichnung || item.zugnummer || "?";
+        const platform = item.gleis || item.ezGleis || item.plattform || item.ezPlattform || null;
+        const cancelled = !!(item.cancelled || item.ausfall || item.canceled || item.storniert);
+
+        return {
+          departure,
+          plannedDeparture: isNaN(plannedDeparture.getTime()) ? departure : plannedDeparture,
+          departureDelay: delaySec,
+          platform,
+          cancelled,
+          lineName,
+          arrival: null,
+          transfers: 0
+        };
+      })
+      .filter(Boolean)
+      .filter(j => j.departure >= new Date(now.getTime() - 60000) && j.departure <= windowEnd)
+      .sort((a, b) => a.departure - b.departure);
+  }
+
   // ---------- Verbindungen laden ----------
 
   async function fetchJourneys(fromStation, toStation) {
+    const proxyBase = getProxyBase();
+    if (proxyBase) {
+      try {
+        return await fetchJourneysViaProxy(proxyBase, fromStation, toStation);
+      } catch (err) {
+        console.warn("Proxy-Route (bahn.de) fehlgeschlagen, Fallback auf Community-APIs:", err);
+      }
+    }
+    await Promise.all([resolveStation(fromStation), resolveStation(toStation)]);
+    return fetchJourneysFallback(fromStation, toStation);
+  }
+
+  async function fetchJourneysFallback(fromStation, toStation) {
     const now = new Date();
     const path = `/journeys?from=${fromStation.id}&to=${toStation.id}` +
       `&departure=${encodeURIComponent(now.toISOString())}&results=8&stopovers=false`;
@@ -516,7 +639,7 @@
         </div>
         <div class="row-mid">
           <div class="row-line">${j.lineName}</div>
-          <div class="row-sub">an ${fmtTime(j.arrival)}${j.transfers > 0 ? " · " + j.transfers + "x umsteigen" : ""}</div>
+          <div class="row-sub">${j.arrival ? "an " + fmtTime(j.arrival) : "Richtung " + el.toName.textContent}${j.transfers > 0 ? " · " + j.transfers + "x umsteigen" : ""}</div>
         </div>
         <div class="row-right">
           ${delayHtml}
@@ -549,10 +672,10 @@
     renderLoading();
     try {
       const { from, to } = currentPair();
-      await Promise.all([resolveStation(from), resolveStation(to)]);
       const journeys = await fetchJourneys(from, to);
       renderJourneys(journeys);
-      el.statusText.textContent = "aktualisiert um " + new Date().toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      el.statusText.textContent = "aktualisiert um " + new Date().toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) +
+        (getProxyBase() ? "" : " · ohne eigenen Proxy (Fallback-Quellen)");
     } catch (err) {
       renderError(err.message || "Unbekannter Fehler.", load);
       el.statusText.textContent = "Fehler beim Laden";
@@ -608,35 +731,41 @@
 
   el.locateBtn.addEventListener("click", tryGeolocate);
 
-  document.getElementById("testBahnDeBtn").addEventListener("click", async () => {
-    const out = document.getElementById("testResult");
-    out.style.color = "var(--text-dim)";
-    out.textContent = "teste www.bahn.de/web/api …";
-    const url = "https://www.bahn.de/web/api/reiseloesung/orte?suchbegriff=Saarbr%C3%BCcken%20Hbf&typ=ALL&limit=3";
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
+  // Proxy-Einstellungen: laden, speichern, testen
+  const proxyInput = document.getElementById("proxyInput");
+  const proxyStatus = document.getElementById("proxyStatus");
+  proxyInput.value = getProxyBase();
+
+  async function testProxy(base) {
+    proxyStatus.style.color = "var(--text-dim)";
+    proxyStatus.textContent = "teste Proxy …";
     try {
-      const res = await fetch(url, { signal: controller.signal, mode: "cors", cache: "no-store" });
-      clearTimeout(timer);
-      if (!res.ok) {
-        out.style.color = "var(--red)";
-        out.textContent = "❌ Antwort kam an, aber mit Fehler: HTTP " + res.status + " " + res.statusText;
-        return;
-      }
-      const data = await res.json();
-      out.style.color = "var(--green)";
-      out.textContent = "✅ Es funktioniert! bahn.de liefert direkt Daten:\n" + JSON.stringify(data, null, 2).slice(0, 800);
-      console.log("bahn.de Testantwort (vollständig):", data);
+      const data = await fetchOnce(base + "/web/api/reiseloesung/orte?suchbegriff=Saarbr%C3%BCcken%20Hbf&typ=ALL&limit=3", 8000);
+      proxyStatus.style.color = "var(--green)";
+      proxyStatus.textContent = "✅ Proxy antwortet. Beispiel: " + JSON.stringify(data).slice(0, 200) + " …";
+      return true;
     } catch (err) {
-      clearTimeout(timer);
-      out.style.color = "var(--red)";
-      if (err.name === "AbortError") {
-        out.textContent = "❌ Zeitüberschreitung nach 8s – keine Antwort von bahn.de.";
-      } else {
-        out.textContent = "❌ Fehlgeschlagen: " + err.name + ": " + err.message +
-          "\nDas ist fast sicher eine CORS-Blockade – bahn.de lässt direkte Anfragen von fremden Webseiten wie dieser nicht zu.";
-      }
+      proxyStatus.style.color = "var(--red)";
+      proxyStatus.textContent = "❌ " + (err.name === "AbortError" ? "Zeitüberschreitung." : err.name + ": " + err.message);
+      return false;
     }
+  }
+
+  document.getElementById("proxySaveBtn").addEventListener("click", async () => {
+    const val = proxyInput.value.trim().replace(/\/+$/, "");
+    if (!val) {
+      localStorage.removeItem("proxyBase");
+      proxyStatus.style.color = "var(--text-dim)";
+      proxyStatus.textContent = "Proxy entfernt – nutze wieder die Fallback-Quellen.";
+      load();
+      return;
+    }
+    localStorage.setItem("proxyBase", val);
+    // gecachte Stations-IDs verwerfen, falls vorher ein anderer/kein Proxy genutzt wurde
+    localStorage.removeItem("bahndeId:sb");
+    localStorage.removeItem("bahndeId:dl");
+    const ok = await testProxy(val);
+    if (ok) load();
   });
 
   document.addEventListener("visibilitychange", () => {
