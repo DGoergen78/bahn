@@ -476,6 +476,18 @@
     localStorage.setItem(cacheKey, JSON.stringify(station.bahnde));
   }
 
+  async function fetchAbfahrtenBatch(proxyBase, fromStation, when) {
+    const path = `/web/api/reiseloesung/abfahrten?datum=${localDatum(when)}&zeit=${encodeURIComponent(localZeit(when))}` +
+      `&ortExtId=${encodeURIComponent(fromStation.bahnde.extId)}&ortId=${encodeURIComponent(fromStation.bahnde.ortId)}` +
+      `&mitVias=true&maxVias=40`;
+    const data = await fetchOnce(proxyBase + path, 8000);
+    const arr = Array.isArray(data) ? data : (data.entries || data.abfahrten || Object.values(data).find(v => Array.isArray(v)) || null);
+    if (!Array.isArray(arr)) {
+      throw new Error("bahn.de (Proxy): Unerwartetes Antwortformat bei den Abfahrten.\n" + JSON.stringify(data).slice(0, 300));
+    }
+    return arr;
+  }
+
   async function fetchJourneysViaProxy(proxyBase, fromStation, toStation) {
     await Promise.all([
       resolveStationBahnDe(proxyBase, fromStation),
@@ -483,21 +495,37 @@
     ]);
 
     const now = new Date();
-    const path = `/web/api/reiseloesung/abfahrten?datum=${localDatum(now)}&zeit=${encodeURIComponent(localZeit(now))}` +
-      `&ortExtId=${encodeURIComponent(fromStation.bahnde.extId)}&ortId=${encodeURIComponent(fromStation.bahnde.ortId)}` +
-      `&mitVias=true&maxVias=8`;
-    const data = await fetchOnce(proxyBase + path, 8000);
-    const arr = Array.isArray(data) ? data : (data.entries || data.abfahrten || Object.values(data).find(v => Array.isArray(v)) || null);
-    if (!Array.isArray(arr)) {
-      throw new Error("bahn.de (Proxy): Unerwartetes Antwortformat bei den Abfahrten.\n" + JSON.stringify(data).slice(0, 300));
-    }
-
-    // Da der genaue Feldname für Zwischenhalte unsicher ist, wird der komplette
-    // Datensatz als Text durchsucht: robust gegen unbekannte Feldnamen.
-    const targetNames = [toStation.bahnde.name, toStation.label, toStation.label.replace(" (Saar)", "")].filter(Boolean);
     const windowEnd = new Date(now.getTime() + WINDOW_MIN * 60000);
 
-    return arr
+    // Der Endpunkt liefert pro Aufruf nur eine begrenzte Anzahl an Abfahrten
+    // über ALLE Richtungen hinweg. An großen Bahnhöfen reicht ein einzelner
+    // Aufruf daher oft nicht für ein volles 60-Minuten-Fenster – deshalb wird
+    // die Startzeit schrittweise vorgeschoben, bis das Fenster abgedeckt ist.
+    const seen = new Map();
+    let cursor = now;
+    for (let i = 0; i < 15; i++) {
+      const batch = await fetchAbfahrtenBatch(proxyBase, fromStation, cursor);
+      if (!batch.length) break;
+
+      let lastTime = null;
+      for (const item of batch) {
+        const key = item.journeyId || ((item.zeit || "") + "|" + (item.verkehrmittel && item.verkehrmittel.name));
+        if (!seen.has(key)) seen.set(key, item);
+        const t = new Date(item.ezZeit || item.zeit);
+        if (!isNaN(t.getTime()) && (!lastTime || t > lastTime)) lastTime = t;
+      }
+      if (!lastTime || lastTime >= windowEnd) break;
+      cursor = new Date(lastTime.getTime() + 60000);
+    }
+
+    const targetNames = [
+      toStation.bahnde.name,
+      toStation.label,
+      toStation.label.replace(" (", "("),
+      toStation.label.replace(" (Saar)", "")
+    ].filter(Boolean);
+
+    const mapped = Array.from(seen.values())
       .map(item => {
         const raw = JSON.stringify(item);
         if (!targetNames.some(n => raw.includes(n))) return null;
@@ -512,13 +540,12 @@
         let delaySec = null;
         if (typeof item.verspaetung === "number") {
           delaySec = item.verspaetung * 60;
-        } else if (!isNaN(plannedDeparture.getTime())) {
-          const diff = Math.round((departure - plannedDeparture) / 1000);
-          if (diff !== 0) delaySec = diff;
+        } else if (!isNaN(plannedDeparture.getTime()) && !isNaN(departure.getTime())) {
+          delaySec = Math.round((departure - plannedDeparture) / 1000);
         }
 
-        const vm = item.verkehrsmittel || {};
-        const lineName = vm.kurzText || vm.name || item.linienbezeichnung || item.zugnummer || "?";
+        const vm = item.verkehrmittel || item.verkehrsmittel || {};
+        const lineName = vm.mittelText || vm.linienNummer || vm.langText || vm.kurzText || item.linienbezeichnung || item.zugnummer || "?";
         const platform = item.gleis || item.ezGleis || item.plattform || item.ezPlattform || null;
         const cancelled = !!(item.cancelled || item.ausfall || item.canceled || item.storniert);
 
@@ -534,9 +561,12 @@
           raw: item
         };
       })
-      .filter(Boolean)
+      .filter(Boolean);
+
+    const result = mapped
       .filter(j => j.departure >= new Date(now.getTime() - 60000) && j.departure <= windowEnd)
       .sort((a, b) => a.departure - b.departure);
+    return result;
   }
 
   // ---------- Verbindungen laden ----------
@@ -648,28 +678,6 @@
         </div>
       `;
       el.list.appendChild(row);
-    }
-
-    if (journeys[0] && journeys[0].raw) {
-      const dbg = document.createElement("details");
-      dbg.style.marginTop = "8px";
-      dbg.style.fontSize = "11px";
-      dbg.style.color = "var(--text-dim)";
-      const summary = document.createElement("summary");
-      summary.textContent = "🔍 Rohdaten (für Debug – zum Kopieren antippen & senden)";
-      summary.style.cursor = "pointer";
-      dbg.appendChild(summary);
-      const pre = document.createElement("pre");
-      pre.style.whiteSpace = "pre-wrap";
-      pre.style.wordBreak = "break-word";
-      pre.style.background = "var(--panel)";
-      pre.style.border = "1px solid var(--line)";
-      pre.style.borderRadius = "8px";
-      pre.style.padding = "10px";
-      pre.style.marginTop = "6px";
-      pre.textContent = JSON.stringify(journeys[0].raw, null, 2);
-      dbg.appendChild(pre);
-      el.list.appendChild(dbg);
     }
   }
 
