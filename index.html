@@ -306,7 +306,12 @@
 (function () {
   "use strict";
 
-  const API = "https://v6.db.transport.rest";
+  // Mehrere Endpunkte, da die offizielle API zeitweise instabil/down sein kann.
+  // Die App probiert sie der Reihe nach durch und merkt sich, welche funktioniert hat.
+  const API_BASES = [
+    "https://v6.db.transport.rest",
+    "https://db.emmabyte.de"
+  ];
   const WINDOW_MIN = 60;       // Zeitfenster in Minuten
   const REFRESH_MS = 30000;    // Auto-Refresh Intervall
 
@@ -357,28 +362,43 @@
 
   // ---------- Stationen auflösen (einmalig, dann Cache) ----------
 
-  // Fetch mit Timeout + möglichst sprechender Fehlermeldung
-  async function fetchJson(url, timeoutMs) {
+  // Fetch mit Timeout, der mehrere API-Basen durchprobiert und sich die
+  // funktionierende merkt (falls die primäre Quelle down ist).
+  async function fetchOnce(url, timeoutMs) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs || 10000);
-    let res;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      res = await fetch(url, { signal: controller.signal, mode: "cors", cache: "no-store" });
-    } catch (err) {
-      if (err.name === "AbortError") {
-        throw new Error("Zeitüberschreitung: Die API hat nach " + (timeoutMs || 10000) / 1000 + "s nicht geantwortet. Prüfe deine Internetverbindung.");
+      const res = await fetch(url, { signal: controller.signal, mode: "cors", cache: "no-store" });
+      if (!res.ok) {
+        let detail = "";
+        try { detail = (await res.text()).slice(0, 200); } catch (e) {}
+        throw new Error("API-Fehler " + res.status + " " + res.statusText + (detail ? " – " + detail : ""));
       }
-      // "Load failed" / "Failed to fetch" landen hier: Netzwerk, CORS, Adblocker, offline, o.ä.
-      throw new Error("Netzwerkfehler (" + err.name + ": " + err.message + "). Mögliche Ursachen: keine Internetverbindung, ein Inhalte-/Werbeblocker blockiert die Domain v6.db.transport.rest, oder die Datei wurde lokal (file://) statt über https:// geöffnet.");
+      return await res.json();
     } finally {
       clearTimeout(timer);
     }
-    if (!res.ok) {
-      let detail = "";
-      try { detail = (await res.text()).slice(0, 200); } catch (e) {}
-      throw new Error("API-Fehler " + res.status + " " + res.statusText + (detail ? " – " + detail : ""));
+  }
+
+  async function fetchJson(path) {
+    const preferred = localStorage.getItem("apiBase");
+    const bases = preferred ? [preferred, ...API_BASES.filter(b => b !== preferred)] : API_BASES;
+    const errors = [];
+    for (const base of bases) {
+      try {
+        const data = await fetchOnce(base + path, 7000);
+        localStorage.setItem("apiBase", base);
+        return data;
+      } catch (err) {
+        const reason = err.name === "AbortError" ? "Zeitüberschreitung (7s)" : (err.name + ": " + err.message);
+        errors.push(base + " → " + reason);
+      }
     }
-    return res.json();
+    throw new Error(
+      "Keine der Datenquellen war erreichbar. Mögliche Ursachen: keine Internetverbindung, " +
+      "ein Inhalte-/Werbeblocker blockiert die Domain, oder die APIs sind gerade down.\n" +
+      errors.join("\n")
+    );
   }
 
   async function resolveStation(station) {
@@ -387,8 +407,8 @@
       station.id = cached;
       return;
     }
-    const url = `${API}/locations?query=${encodeURIComponent(station.query)}&results=6&poi=false&addresses=false`;
-    const results = await fetchJson(url);
+    const path = `/locations?query=${encodeURIComponent(station.query)}&results=6&poi=false&addresses=false`;
+    const results = await fetchJson(path);
     const stops = results.filter(r => r.type === "stop" && r.location);
     if (!stops.length) throw new Error("Station nicht gefunden: " + station.label);
     // Nächstgelegenen Treffer zur Referenzkoordinate wählen (löst Namensdopplungen auf)
@@ -406,9 +426,9 @@
 
   async function fetchJourneys(fromStation, toStation) {
     const now = new Date();
-    const url = `${API}/journeys?from=${fromStation.id}&to=${toStation.id}` +
+    const path = `/journeys?from=${fromStation.id}&to=${toStation.id}` +
       `&departure=${encodeURIComponent(now.toISOString())}&results=8&stopovers=false`;
-    const data = await fetchJson(url);
+    const data = await fetchJson(path);
     const journeys = data.journeys || [];
 
     const windowEnd = new Date(now.getTime() + WINDOW_MIN * 60000);
@@ -446,9 +466,14 @@
     el.list.innerHTML = "";
     const wrap = document.createElement("div");
     wrap.className = "error";
-    wrap.innerHTML = `${msg}<br>`;
+    const msgEl = document.createElement("div");
+    msgEl.style.whiteSpace = "pre-line";
+    msgEl.style.textAlign = "left";
+    msgEl.textContent = msg;
+    wrap.appendChild(msgEl);
     const btn = document.createElement("button");
     btn.textContent = "Erneut versuchen";
+    btn.style.marginTop = "12px";
     btn.onclick = retryFn;
     wrap.appendChild(btn);
     el.list.appendChild(wrap);
