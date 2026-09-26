@@ -308,7 +308,7 @@
   </div>
 
   <footer>
-    Daten: bahn.de (über eigenen Proxy) mit Fallback auf öffentliche Spiegel · Auto-Update alle 30&nbsp;s
+    Daten: bahn.de (über eigenen Proxy) mit Fallback auf öffentliche Spiegel · Aktualisiert beim Öffnen der App
   </footer>
 </div>
 
@@ -323,7 +323,6 @@
     "https://v6.db.transport.rest"
   ];
   const WINDOW_MIN = 60;       // Zeitfenster in Minuten
-  const REFRESH_MS = 30000;    // Auto-Refresh Intervall
 
   // Referenzkoordinaten zum eindeutigen Auflösen der Stationen
   // (verhindert Verwechslung z.B. mit "Dillingen (Donau)")
@@ -334,7 +333,6 @@
 
   let direction = localStorage.getItem("direction") || "sb-dl"; // "sb-dl" oder "dl-sb"
   let autoMode = true;
-  let refreshTimer = null;
 
   const el = {
     fromName: document.getElementById("fromName"),
@@ -721,11 +719,6 @@
     load();
   }
 
-  function restartTimer() {
-    if (refreshTimer) clearInterval(refreshTimer);
-    refreshTimer = setInterval(load, REFRESH_MS);
-  }
-
   // ---------- Geolocation ----------
 
   function tryGeolocate() {
@@ -829,7 +822,6 @@
   updateHeader();
   tryGeolocate();   // versucht Standort zu ermitteln, lädt danach automatisch
   load();           // sofort mit letzter bekannter/Default-Richtung laden, wird ggf. durch Geolocation überschrieben
-  restartTimer();
 
 })();
 </script>
