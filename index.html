@@ -208,6 +208,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .row.past .row-time { color: var(--text-dim); }
+  .row.past .row-sub { color: var(--text); font-weight: 600; }
+  .row.past .row-sub.late { color: var(--red); }
+  .row-sub.late { color: var(--red); }
   .row-right {
     text-align: right;
     display: flex;
@@ -270,8 +274,7 @@
 <body>
 <div class="app">
   <header>
-    <div class="title-row">
-      <h1>Nächste Züge · nächste 2 Std.</h1>
+    <div class="title-row" style="justify-content:flex-end;">
       <div class="clock" id="clock">--:--</div>
     </div>
   </header>
@@ -283,46 +286,33 @@
       <div class="route-station to" id="toName">Dillingen (Saar)</div>
     </div>
     <div class="route-meta">
-      <span id="statusText">wird geladen …</span>
+      <span id="statusText"></span>
       <span class="badge-auto" id="autoBadge"><span class="dot"></span><span id="autoBadgeText">Standort</span></span>
     </div>
   </div>
 
   <div class="controls">
-    <button class="btn-locate" id="locateBtn">📍 Standort erneut prüfen</button>
-    <button class="btn-swap" id="swapBtn">⇄ Richtung tauschen</button>
+    <button class="btn-locate" id="locateBtn">📍 Standort</button>
+    <button class="btn-swap" id="swapBtn">⇄ Richtung</button>
   </div>
 
-  <div class="route" style="padding:14px 16px; margin-top:10px;">
-    <div class="section-label" style="margin:0 0 8px;">⚙️ Eigener Proxy (optional, aber empfohlen)</div>
-    <div style="display:flex; gap:8px;">
-      <input id="proxyInput" type="url" placeholder="https://dein-worker.workers.dev"
-        style="flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); color:var(--text); border-radius:10px; padding:10px 12px; font-size:13px; font-family:inherit;">
-      <button id="proxySaveBtn">Speichern</button>
-    </div>
-    <div id="proxyStatus" style="font-size:12px; color:var(--text-dim); margin-top:8px; white-space:pre-line;"></div>
-  </div>
-
-  <div class="list" id="list">
-    <div class="loading">Verbindungen werden geladen …</div>
-  </div>
-
-  <footer>
-    Daten: bahn.de (über eigenen Proxy) mit Fallback auf öffentliche Spiegel · Aktualisiert beim Öffnen der App
-  </footer>
+  <div class="list" id="list"></div>
 </div>
 
 <script>
 (function () {
   "use strict";
 
-  // Fallback-Endpunkte (Community-Spiegel), falls kein eigener Proxy
-  // eingerichtet ist oder dieser gerade nicht erreichbar ist.
+  // Eigener Cloudflare-Worker-Proxy (leitet Anfragen an bahn.de weiter)
+  const PROXY_BASE = "https://db-proxy.daniel-goergen.workers.dev";
+
+  // Fallback-Endpunkte (Community-Spiegel), falls der Proxy nicht erreichbar ist.
   const API_BASES = [
     "https://db.emmabyte.de",
     "https://v6.db.transport.rest"
   ];
   const WINDOW_MIN = 120;      // Zeitfenster in Minuten
+  const PAST_MIN = 30;         // wie weit zurück (bereits abgefahrene Züge, die noch unterwegs sind)
 
   // Referenzkoordinaten zum eindeutigen Auflösen der Stationen
   // (verhindert Verwechslung z.B. mit "Dillingen (Donau)")
@@ -430,11 +420,10 @@
     localStorage.setItem("stationId:" + station.key, best.id);
   }
 
-  // ---------- Proxy-Einstellungen ----------
+  // ---------- Hilfsfunktionen für bahn.de ----------
 
   function getProxyBase() {
-    const v = (localStorage.getItem("proxyBase") || "").trim();
-    return v ? v.replace(/\/+$/, "") : "";
+    return PROXY_BASE;
   }
 
   function pad2(n) { return String(n).padStart(2, "0"); }
@@ -474,16 +463,44 @@
     localStorage.setItem(cacheKey, JSON.stringify(station.bahnde));
   }
 
-  async function fetchAbfahrtenBatch(proxyBase, fromStation, when) {
-    const path = `/web/api/reiseloesung/abfahrten?datum=${localDatum(when)}&zeit=${encodeURIComponent(localZeit(when))}` +
-      `&ortExtId=${encodeURIComponent(fromStation.bahnde.extId)}&ortId=${encodeURIComponent(fromStation.bahnde.ortId)}` +
+  async function fetchBoardBatch(proxyBase, board, station, when) {
+    const path = `/web/api/reiseloesung/${board}?datum=${localDatum(when)}&zeit=${encodeURIComponent(localZeit(when))}` +
+      `&ortExtId=${encodeURIComponent(station.bahnde.extId)}&ortId=${encodeURIComponent(station.bahnde.ortId)}` +
       `&mitVias=true&maxVias=40`;
     const data = await fetchOnce(proxyBase + path, 8000);
-    const arr = Array.isArray(data) ? data : (data.entries || data.abfahrten || Object.values(data).find(v => Array.isArray(v)) || null);
+    const arr = Array.isArray(data) ? data : (data.entries || data.abfahrten || data.ankuenfte || Object.values(data).find(v => Array.isArray(v)) || null);
     if (!Array.isArray(arr)) {
-      throw new Error("bahn.de (Proxy): Unerwartetes Antwortformat bei den Abfahrten.\n" + JSON.stringify(data).slice(0, 300));
+      throw new Error("bahn.de (Proxy): Unerwartetes Antwortformat (" + board + ").\n" + JSON.stringify(data).slice(0, 300));
     }
     return arr;
+  }
+
+  // Der Endpunkt liefert pro Aufruf nur eine begrenzte Anzahl an Einträgen über
+  // ALLE Richtungen hinweg. Deshalb wird die Startzeit schrittweise vorgeschoben,
+  // bis das gewünschte Zeitfenster abgedeckt ist.
+  async function collectBoard(proxyBase, board, station, start, end, maxIter) {
+    const seen = new Map();
+    let cursor = start;
+    for (let i = 0; i < maxIter; i++) {
+      const batch = await fetchBoardBatch(proxyBase, board, station, cursor);
+      if (!batch.length) break;
+
+      let lastTime = null;
+      for (const item of batch) {
+        const key = item.journeyId || ((item.zeit || "") + "|" + (item.verkehrmittel && item.verkehrmittel.name));
+        if (!seen.has(key)) seen.set(key, item);
+        const t = new Date(item.ezZeit || item.zeit);
+        if (!isNaN(t.getTime()) && (!lastTime || t > lastTime)) lastTime = t;
+      }
+      if (!lastTime || lastTime >= end) break;
+      cursor = new Date(lastTime.getTime() + 60000);
+    }
+    return seen;
+  }
+
+  function trainKey(item) {
+    const vm = item.verkehrmittel || item.verkehrsmittel || {};
+    return (vm.name || "") + "|" + (vm.linienNummer || "");
   }
 
   async function fetchJourneysViaProxy(proxyBase, fromStation, toStation) {
@@ -494,26 +511,43 @@
 
     const now = new Date();
     const windowEnd = new Date(now.getTime() + WINDOW_MIN * 60000);
+    const windowStart = new Date(now.getTime() - PAST_MIN * 60000);
 
-    // Der Endpunkt liefert pro Aufruf nur eine begrenzte Anzahl an Abfahrten
-    // über ALLE Richtungen hinweg. An großen Bahnhöfen reicht ein einzelner
-    // Aufruf daher oft nicht für ein volles 60-Minuten-Fenster – deshalb wird
-    // die Startzeit schrittweise vorgeschoben, bis das Fenster abgedeckt ist.
-    const seen = new Map();
-    let cursor = now;
-    for (let i = 0; i < 15; i++) {
-      const batch = await fetchAbfahrtenBatch(proxyBase, fromStation, cursor);
-      if (!batch.length) break;
+    // Abfahrten am Start und Ankünfte am Ziel parallel holen.
+    // Ein Fehler bei den Ankünften darf die Liste nicht verhindern.
+    const [seen, arrivals] = await Promise.all([
+      collectBoard(proxyBase, "abfahrten", fromStation, windowStart, windowEnd, 15),
+      collectBoard(proxyBase, "ankuenfte", toStation, windowStart, new Date(windowEnd.getTime() + 60 * 60000), 15)
+        .catch(err => { console.warn("Ankunftstafel nicht verfügbar:", err); return new Map(); })
+    ]);
 
-      let lastTime = null;
-      for (const item of batch) {
-        const key = item.journeyId || ((item.zeit || "") + "|" + (item.verkehrmittel && item.verkehrmittel.name));
-        if (!seen.has(key)) seen.set(key, item);
-        const t = new Date(item.ezZeit || item.zeit);
-        if (!isNaN(t.getTime()) && (!lastTime || t > lastTime)) lastTime = t;
+    // Ankünfte nach Zugnummer gruppieren
+    const arrivalsByTrain = new Map();
+    for (const a of arrivals.values()) {
+      const k = trainKey(a);
+      if (!arrivalsByTrain.has(k)) arrivalsByTrain.set(k, []);
+      arrivalsByTrain.get(k).push(a);
+    }
+
+    // Passende Ankunft zu einer Abfahrt: gleiche Zugnummer, planmäßige Ankunft
+    // nach der planmäßigen Abfahrt (frühester Treffer).
+    function findArrival(depItem, plannedDeparture) {
+      const list = arrivalsByTrain.get(trainKey(depItem));
+      if (!list) return null;
+      let best = null, bestT = Infinity;
+      for (const a of list) {
+        const planned = new Date(a.zeit);
+        if (isNaN(planned.getTime())) continue;
+        const diff = planned - plannedDeparture;
+        if (diff >= -60000 && diff < 6 * 3600000 && diff < bestT) { bestT = diff; best = a; }
       }
-      if (!lastTime || lastTime >= windowEnd) break;
-      cursor = new Date(lastTime.getTime() + 60000);
+      if (!best) return null;
+      const plannedArr = new Date(best.zeit);
+      const realArr = new Date(best.ezZeit || best.zeit);
+      return {
+        arrival: isNaN(realArr.getTime()) ? plannedArr : realArr,
+        arrivalDelaySec: isNaN(realArr.getTime()) ? null : Math.round((realArr - plannedArr) / 1000)
+      };
     }
 
     const targetNames = [
@@ -546,6 +580,7 @@
         const lineName = vm.mittelText || vm.linienNummer || vm.langText || vm.kurzText || item.linienbezeichnung || item.zugnummer || "?";
         const platform = item.gleis || item.ezGleis || item.plattform || item.ezPlattform || null;
         const cancelled = !!(item.cancelled || item.ausfall || item.canceled || item.storniert);
+        const arr = findArrival(item, isNaN(plannedDeparture.getTime()) ? departure : plannedDeparture);
 
         return {
           departure,
@@ -554,15 +589,17 @@
           platform,
           cancelled,
           lineName,
-          arrival: null,
-          transfers: 0,
-          raw: item
+          arrival: arr ? arr.arrival : null,
+          arrivalDelaySec: arr ? arr.arrivalDelaySec : null,
+          transfers: 0
         };
       })
       .filter(Boolean);
 
     const result = mapped
-      .filter(j => j.departure >= new Date(now.getTime() - 60000) && j.departure <= windowEnd)
+      .filter(j => j.departure >= windowStart && j.departure <= windowEnd)
+      // bereits abgefahrene Züge nur, solange sie noch nicht am Ziel angekommen sind
+      .filter(j => !(j.arrival && j.arrival < new Date(now.getTime() - 60000)))
       .sort((a, b) => a.departure - b.departure);
     return result;
   }
@@ -640,12 +677,12 @@
   function renderJourneys(journeys) {
     el.list.innerHTML = "";
     if (!journeys.length) {
-      el.list.innerHTML = `<div class="empty">Keine Verbindungen in den nächsten ${WINDOW_MIN} Minuten.</div>`;
+      el.list.innerHTML = `<div class="empty">Keine Verbindungen.</div>`;
       return;
     }
     for (const j of journeys) {
       const row = document.createElement("div");
-      row.className = "row";
+      row.className = "row" + (j.departure < new Date() ? " past" : "");
 
       const delayMin = typeof j.departureDelay === "number" ? Math.round(j.departureDelay / 60) : null;
       const showPlanned = delayMin && delayMin !== 0;
@@ -661,6 +698,10 @@
         delayHtml = `<span class="delay late">+${delayMin} min</span>`;
       }
 
+      const arrLate = typeof j.arrivalDelaySec === "number" && j.arrivalDelaySec >= 60;
+      const subText = (j.arrival ? "an " + fmtTime(j.arrival) : "") +
+        (j.transfers > 0 ? (j.arrival ? " · " : "") + j.transfers + "x umsteigen" : "");
+
       row.innerHTML = `
         <div class="row-time">
           ${fmtTime(j.departure)}
@@ -668,7 +709,7 @@
         </div>
         <div class="row-mid">
           <div class="row-line">${j.lineName}</div>
-          <div class="row-sub">${j.arrival ? "an " + fmtTime(j.arrival) : "Richtung " + el.toName.textContent}${j.transfers > 0 ? " · " + j.transfers + "x umsteigen" : ""}</div>
+          ${subText ? `<div class="row-sub${arrLate ? " late" : ""}">${subText}</div>` : ""}
         </div>
         <div class="row-right">
           ${delayHtml}
@@ -692,22 +733,21 @@
     el.fromName.textContent = from.label;
     el.toName.textContent = to.label;
     el.autoBadge.classList.toggle("off", !autoMode);
-    el.autoBadgeText.textContent = autoMode ? "automatisch (Standort)" : "manuell";
+    el.autoBadgeText.textContent = autoMode ? "Standort" : "manuell";
   }
 
   async function load() {
     updateHeader();
-    el.statusText.textContent = "wird geladen …";
+    el.statusText.textContent = "";
     renderLoading();
     try {
       const { from, to } = currentPair();
       const journeys = await fetchJourneys(from, to);
       renderJourneys(journeys);
-      el.statusText.textContent = "aktualisiert um " + new Date().toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) +
-        (getProxyBase() ? "" : " · ohne eigenen Proxy (Fallback-Quellen)");
+      el.statusText.textContent = "Stand " + new Date().toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
     } catch (err) {
       renderError(err.message || "Unbekannter Fehler.", load);
-      el.statusText.textContent = "Fehler beim Laden";
+      el.statusText.textContent = "Fehler";
       console.error(err);
     }
   }
@@ -727,18 +767,18 @@
       updateHeader();
       return;
     }
-    el.locateBtn.textContent = "📍 wird geortet …";
+    el.locateBtn.textContent = "📍 …";
     navigator.geolocation.getCurrentPosition(
       pos => {
         const { latitude, longitude } = pos.coords;
         const dSb = haversine(latitude, longitude, STATIONS.sb.lat, STATIONS.sb.lon);
         const dDl = haversine(latitude, longitude, STATIONS.dl.lat, STATIONS.dl.lon);
         const dir = dSb <= dDl ? "sb-dl" : "dl-sb";
-        el.locateBtn.textContent = "📍 Standort erneut prüfen";
+        el.locateBtn.textContent = "📍 Standort";
         setDirection(dir, true);
       },
       err => {
-        el.locateBtn.textContent = "📍 Standort erneut prüfen";
+        el.locateBtn.textContent = "📍 Standort";
         autoMode = false;
         updateHeader();
         console.warn("Geolocation nicht verfügbar:", err.message);
@@ -754,43 +794,6 @@
   });
 
   el.locateBtn.addEventListener("click", tryGeolocate);
-
-  // Proxy-Einstellungen: laden, speichern, testen
-  const proxyInput = document.getElementById("proxyInput");
-  const proxyStatus = document.getElementById("proxyStatus");
-  proxyInput.value = getProxyBase();
-
-  async function testProxy(base) {
-    proxyStatus.style.color = "var(--text-dim)";
-    proxyStatus.textContent = "teste Proxy …";
-    try {
-      const data = await fetchOnce(base + "/web/api/reiseloesung/orte?suchbegriff=Saarbr%C3%BCcken%20Hbf&typ=ALL&limit=3", 8000);
-      proxyStatus.style.color = "var(--green)";
-      proxyStatus.textContent = "✅ Proxy antwortet. Beispiel: " + JSON.stringify(data).slice(0, 200) + " …";
-      return true;
-    } catch (err) {
-      proxyStatus.style.color = "var(--red)";
-      proxyStatus.textContent = "❌ " + (err.name === "AbortError" ? "Zeitüberschreitung." : err.name + ": " + err.message);
-      return false;
-    }
-  }
-
-  document.getElementById("proxySaveBtn").addEventListener("click", async () => {
-    const val = proxyInput.value.trim().replace(/\/+$/, "");
-    if (!val) {
-      localStorage.removeItem("proxyBase");
-      proxyStatus.style.color = "var(--text-dim)";
-      proxyStatus.textContent = "Proxy entfernt – nutze wieder die Fallback-Quellen.";
-      load();
-      return;
-    }
-    localStorage.setItem("proxyBase", val);
-    // gecachte Stations-IDs verwerfen, falls vorher ein anderer/kein Proxy genutzt wurde
-    localStorage.removeItem("bahndeId:sb");
-    localStorage.removeItem("bahndeId:dl");
-    const ok = await testProxy(val);
-    if (ok) load();
-  });
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
