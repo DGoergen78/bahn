@@ -736,16 +736,20 @@
     el.autoBadgeText.textContent = autoMode ? "Standort" : "manuell";
   }
 
+  let loadSeq = 0;
   async function load() {
+    const mySeq = ++loadSeq;
     updateHeader();
     el.statusText.textContent = "";
     renderLoading();
     try {
       const { from, to } = currentPair();
       const journeys = await fetchJourneys(from, to);
+      if (mySeq !== loadSeq) return;   // inzwischen wurde neu geladen -> veraltet
       renderJourneys(journeys);
       el.statusText.textContent = "Stand " + new Date().toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
     } catch (err) {
+      if (mySeq !== loadSeq) return;
       renderError(err.message || "Unbekannter Fehler.", load);
       el.statusText.textContent = "Fehler";
       console.error(err);
@@ -761,29 +765,39 @@
 
   // ---------- Geolocation ----------
 
+  // Bestimmt die Richtung per Standort und lädt danach genau EINMAL.
+  // (Auch bei Fehler/Verweigerung wird geladen – dann mit der gespeicherten Richtung.)
+  let geoBusy = false;
   function tryGeolocate() {
+    geoBusy = true;
+    el.locateBtn.textContent = "📍 …";
+    renderLoading();
+    const done = () => { geoBusy = false; el.locateBtn.textContent = "📍 Standort"; };
+
     if (!("geolocation" in navigator)) {
       autoMode = false;
-      updateHeader();
+      done();
+      load();
       return;
     }
-    el.locateBtn.textContent = "📍 …";
     navigator.geolocation.getCurrentPosition(
       pos => {
         const { latitude, longitude } = pos.coords;
         const dSb = haversine(latitude, longitude, STATIONS.sb.lat, STATIONS.sb.lon);
         const dDl = haversine(latitude, longitude, STATIONS.dl.lat, STATIONS.dl.lon);
-        const dir = dSb <= dDl ? "sb-dl" : "dl-sb";
-        el.locateBtn.textContent = "📍 Standort";
-        setDirection(dir, true);
+        direction = dSb <= dDl ? "sb-dl" : "dl-sb";
+        autoMode = true;
+        localStorage.setItem("direction", direction);
+        done();
+        load();
       },
       err => {
-        el.locateBtn.textContent = "📍 Standort";
         autoMode = false;
-        updateHeader();
+        done();
         console.warn("Geolocation nicht verfügbar:", err.message);
+        load();
       },
-      { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 }
+      { enableHighAccuracy: false, timeout: 5000, maximumAge: 300000 }
     );
   }
 
@@ -796,7 +810,7 @@
   el.locateBtn.addEventListener("click", tryGeolocate);
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") {
+    if (document.visibilityState === "visible" && !geoBusy) {
       load();
     }
   });
@@ -823,8 +837,7 @@
   // ---------- Start ----------
 
   updateHeader();
-  tryGeolocate();   // versucht Standort zu ermitteln, lädt danach automatisch
-  load();           // sofort mit letzter bekannter/Default-Richtung laden, wird ggf. durch Geolocation überschrieben
+  tryGeolocate();   // ermittelt den Standort und lädt danach einmalig
 
 })();
 </script>
