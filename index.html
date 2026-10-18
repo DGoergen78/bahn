@@ -364,6 +364,9 @@
       if (!res.ok) {
         let detail = "";
         try { detail = (await res.text()).slice(0, 200); } catch (e) {}
+        if (detail.includes("OPS_BLOCKED")) {
+          throw new Error("bahn.de hat zu viele Anfragen kurzzeitig blockiert. Das legt sich meist nach ein paar Minuten von selbst – einfach gleich nochmal versuchen.");
+        }
         throw new Error("Proxy-Fehler " + res.status + (detail ? " – " + detail : ""));
       }
       return await res.json();
@@ -427,77 +430,43 @@
     return arr;
   }
 
-  function median(values) {
-    const a = values.slice().sort((x, y) => x - y);
-    const m = Math.floor(a.length / 2);
-    return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
-  }
-
-  // Zeitpunkte (ms), ab denen noch nicht abgedeckt ist, was bis endMs gebraucht wird.
-  function findGaps(covered, startMs, endMs) {
-    const sorted = covered.slice().sort((a, b) => a[0] - b[0]);
-    const gaps = [];
-    let cur = startMs;
-    for (const [s, e] of sorted) {
-      if (s > cur + 60000) gaps.push(cur);
-      if (e > cur) cur = e;
-    }
-    if (cur < endMs - 60000) gaps.push(cur);
-    return gaps;
-  }
-
   // Der Endpunkt liefert pro Aufruf nur eine begrenzte Anzahl an Einträgen über ALLE
   // Richtungen. Damit das Zeitfenster schnell abgedeckt ist, werden mehrere Startzeiten
   // GLEICHZEITIG abgefragt (statt nacheinander). Bei dichtem Takt entstehende Lücken werden
   // in weiteren Runden geschlossen. Die typische Zeitspanne eines Aufrufs wird gemerkt,
   // damit beim nächsten Mal nur so viele Abrufe wie nötig gemacht werden.
+  // Fragt NACHEINANDER ab (nicht parallel) – bahn.de blockiert bei zu vielen
+  // gleichzeitigen Anfragen (Fehler "OPS_BLOCKED"). Die Startzeit wird jeweils bis
+  // kurz hinter die letzte erhaltene Zeile vorgeschoben, bis das Fenster abgedeckt ist.
   async function collectBoard(proxyBase, board, station, start, end, opts) {
-    const spanKey = "span:" + board + ":" + station.key;
-    const saved = parseFloat(localStorage.getItem(spanKey));
-    const stepMin = saved > 0 ? Math.min(45, Math.max(10, Math.round(saved * 0.8))) : opts.defStepMin;
-
     const seen = new Map();
-    const covered = [];
-    const spans = [];
-    let firstError = null, okCount = 0;
-    const startMs = start.getTime(), endMs = end.getTime();
+    let cursor = start.getTime();
+    const endMs = end.getTime();
+    let okCount = 0, firstError = null;
 
-    async function probe(whenMs) {
+    for (let i = 0; i < 12 && cursor < endMs; i++) {
+      let batch;
       try {
-        const batch = await fetchBoardBatch(proxyBase, board, station, new Date(whenMs), opts.maxVias);
+        batch = await fetchBoardBatch(proxyBase, board, station, new Date(cursor), opts.maxVias);
         okCount++;
-        let last = 0;
-        for (const item of batch) {
-          const key = item.journeyId || ((item.zeit || "") + "|" + (item.verkehrmittel && item.verkehrmittel.name));
-          if (!seen.has(key)) seen.set(key, item);
-          // geplante Zeit (konservativ): stimmt bei Sortierung nach Plan- UND nach Echtzeit
-          const t = new Date(item.zeit || item.ezZeit).getTime();
-          if (!isNaN(t) && t > last) last = t;
-        }
-        if (!batch.length) {
-          covered.push([whenMs, endMs]);                 // nichts mehr da: bis zum Ende abgedeckt
-        } else {
-          const to = Math.max(last, whenMs + 60000);     // mindestens 1 Minute Fortschritt
-          covered.push([whenMs, to]);
-          spans.push((to - whenMs) / 60000);
-        }
       } catch (err) {
         if (!firstError) firstError = err;
+        break;
       }
+      if (!batch.length) break;
+
+      let lastTime = 0;
+      for (const item of batch) {
+        const key = item.journeyId || ((item.zeit || "") + "|" + (item.verkehrmittel && item.verkehrmittel.name));
+        if (!seen.has(key)) seen.set(key, item);
+        const t = new Date(item.zeit || item.ezZeit).getTime();
+        if (!isNaN(t) && t > lastTime) lastTime = t;
+      }
+      if (!lastTime || lastTime >= endMs) break;
+      cursor = lastTime + 60000;
     }
 
-    const starts = [];
-    for (let t = startMs; t < endMs; t += stepMin * 60000) starts.push(t);
-    await Promise.all(starts.map(probe));
     if (okCount === 0) throw firstError || new Error("Keine Daten erhalten.");
-
-    for (let round = 0; round < 3; round++) {
-      const gaps = findGaps(covered, startMs, endMs);
-      if (!gaps.length) break;
-      await Promise.all(gaps.map(probe));
-    }
-
-    if (spans.length) localStorage.setItem(spanKey, String(median(spans)));
     return seen;
   }
 
@@ -855,12 +824,13 @@
     );
   }
 
-  // Beim Öffnen: sofort laden, Gegenrichtung im Hintergrund vorladen, Standort parallel bestimmen.
+  // Beim Öffnen: laden und Standort parallel bestimmen.
+  // (Die Gegenrichtung wird NICHT mehr vorgeladen – das hat zusammen mit den parallelen
+  // Tafel-Abfragen zu viele gleichzeitige Anfragen an bahn.de erzeugt und wurde blockiert.)
   let lastStartAt = 0;
   function start() {
     lastStartAt = Date.now();
     load(true);
-    fetchDir(otherDir(direction), true).catch(() => {});
     locate();
   }
 
