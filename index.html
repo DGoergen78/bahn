@@ -259,13 +259,39 @@
     100% { background-position: -100% 0; }
   }
 
-  footer {
-    margin-top: 16px;
-    text-align: center;
-    font-size: 11px;
-    color: var(--text-dim);
+  .btn-gear { flex-shrink: 0; color: var(--text-dim); }
+
+  /* Einrichtung */
+  .setup[hidden], .list[hidden], .controls[hidden] { display: none; }
+  .setup {
+    margin-top: 18px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 16px;
   }
-  footer a { color: var(--text-dim); }
+  .setup-title { font-size: 15px; font-weight: 700; color: var(--amber); margin-bottom: 8px; }
+  .setup-steps { margin: 0 0 14px; padding-left: 20px; font-size: 13px; line-height: 1.5; color: var(--text-dim); }
+  .setup-steps a { color: var(--amber); }
+  .setup label { display: block; font-size: 12px; color: var(--text-dim); margin-top: 10px; }
+  .setup input {
+    display: block;
+    width: 100%;
+    margin-top: 4px;
+    padding: 11px 12px;
+    font-size: 15px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+  }
+  .setup input:focus { outline: none; border-color: var(--amber-dim); }
+  .setup-msg { min-height: 18px; margin-top: 12px; font-size: 13px; color: var(--text-dim); white-space: pre-line; }
+  .setup-msg.err { color: var(--red); }
+  .setup-actions { display: flex; gap: 8px; margin-top: 10px; }
+  .setup-actions .primary { flex: 1; background: var(--amber); color: #1a1200; border-color: var(--amber); }
+  button:disabled { opacity: 0.5; }
 
   @media (prefers-reduced-motion: reduce) {
     .skeleton { animation: none; }
@@ -295,44 +321,71 @@
   <div class="controls">
     <button class="btn-locate" id="locateBtn">📍 Standort</button>
     <button class="btn-swap" id="swapBtn">⇄ Richtung</button>
+    <button class="btn-gear" id="gearBtn" aria-label="Einrichtung">⚙</button>
   </div>
 
   <div class="list" id="list"></div>
+
+  <div class="setup" id="setup" hidden>
+    <div class="setup-title">Einrichtung</div>
+    <ol class="setup-steps">
+      <li>Auf <a href="https://developers.deutschebahn.com" target="_blank" rel="noopener">developers.deutschebahn.com</a> kostenlos registrieren und anmelden</li>
+      <li>Unter „Anwendungen“ eine Anwendung anlegen (nur ein Name nötig)</li>
+      <li>Unter „Katalog“ die API „Timetables“ im Tarif „Free“ für diese Anwendung abonnieren</li>
+      <li>Client-ID und API-Key der Anwendung hier eintragen</li>
+    </ol>
+    <label>Client-ID<input id="cfgId" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+    <label>API-Key<input id="cfgKey" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+    <label>Proxy-Adresse<input id="cfgProxy" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+    <div class="setup-msg" id="setupMsg"></div>
+    <div class="setup-actions">
+      <button class="primary" id="cfgSave">Speichern &amp; testen</button>
+      <button id="cfgCancel">Abbrechen</button>
+    </div>
+  </div>
 </div>
 
 <script>
 (function () {
   "use strict";
 
-  // Eigener Cloudflare-Worker-Proxy (leitet Anfragen an bahn.de weiter)
-  const PROXY_BASE = "https://db-proxy.daniel-goergen.workers.dev";
+  // Cloudflare-Worker (Version 3) – leitet Anfragen an die offizielle DB-Timetables-API weiter.
+  // Die Adresse kann in der Einrichtung geändert werden.
+  const DEFAULT_PROXY = "https://db-proxy.daniel-goergen.workers.dev";
 
-  const WINDOW_MIN = 120;      // Zeitfenster in Minuten
-  const PAST_MIN = 30;         // wie weit zurück (bereits abgefahrene Züge, die noch unterwegs sind)
+  const WINDOW_MIN = 120;        // Zeitfenster in Minuten
+  const PAST_MIN = 30;          // wie weit zurück (bereits abgefahrene Züge, die noch unterwegs sind)
+  const ARR_EXTRA_MIN = 75;     // so lange nach dem Fensterende werden Ankünfte am Ziel noch gesucht
+  const PLAN_TTL = 15 * 60000;  // Fahrplan (Soll) ändert sich kaum
+  const CHG_TTL = 30000;        // Live-Änderungen (Verspätungen)
+  const FRESH_MS = 60000;       // so lange gelten geladene Daten für einen sofortigen Richtungswechsel
 
-  // Referenzkoordinaten zum eindeutigen Auflösen der Stationen
-  // (verhindert Verwechslung z.B. mit "Dillingen (Donau)")
+  // Referenzkoordinaten für die Standorterkennung; Stationsnamen zum Auflösen der EVA-Nummer
   const STATIONS = {
-    sb: { key: "sb", label: "Saarbrücken Hbf",  query: "Saarbrücken Hbf",   lat: 49.2414,  lon: 6.9906,  id: null, bahnde: null },
-    dl: { key: "dl", label: "Dillingen (Saar)",  query: "Dillingen (Saar)", lat: 49.35263, lon: 6.72258, id: null, bahnde: null }
+    sb: { key: "sb", label: "Saarbrücken Hbf", patterns: ["Saarbrücken Hbf"], exact: "Saarbrücken Hbf",
+          must: "saarbrücken", fallbackEva: "8000323", lat: 49.2414, lon: 6.9906, eva: null, name: null },
+    dl: { key: "dl", label: "Dillingen (Saar)", patterns: ["Dillingen(Saar)", "Dillingen"], exact: "Dillingen(Saar)",
+          must: "saar", fallbackEva: null, lat: 49.35263, lon: 6.72258, eva: null, name: null }
   };
 
-  let direction = localStorage.getItem("direction") || "sb-dl"; // "sb-dl" oder "dl-sb"
+  let direction = store("direction") || "sb-dl"; // "sb-dl" oder "dl-sb"
   let autoMode = true;
+  let setupOpen = false;
 
+  const $ = id => document.getElementById(id);
   const el = {
-    fromName: document.getElementById("fromName"),
-    toName: document.getElementById("toName"),
-    statusText: document.getElementById("statusText"),
-    list: document.getElementById("list"),
-    swapBtn: document.getElementById("swapBtn"),
-    locateBtn: document.getElementById("locateBtn"),
-    autoBadge: document.getElementById("autoBadge"),
-    autoBadgeText: document.getElementById("autoBadgeText"),
-    clock: document.getElementById("clock")
+    fromName: $("fromName"), toName: $("toName"), statusText: $("statusText"),
+    list: $("list"), controls: document.querySelector(".controls"),
+    swapBtn: $("swapBtn"), locateBtn: $("locateBtn"), gearBtn: $("gearBtn"),
+    autoBadge: $("autoBadge"), autoBadgeText: $("autoBadgeText"), clock: $("clock"),
+    setup: $("setup"), cfgId: $("cfgId"), cfgKey: $("cfgKey"), cfgProxy: $("cfgProxy"),
+    setupMsg: $("setupMsg"), cfgSave: $("cfgSave"), cfgCancel: $("cfgCancel")
   };
 
   // ---------- Hilfsfunktionen ----------
+
+  function store(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function setStore(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* egal */ } }
 
   function haversine(lat1, lon1, lat2, lon2) {
     const R = 6371;
@@ -344,9 +397,36 @@
     return 2 * R * Math.asin(Math.sqrt(a));
   }
 
-  function fmtTime(iso) {
-    return new Date(iso).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
+  function fmtTime(d) {
+    return d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
   }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  function pad2(n) { return String(n).padStart(2, "0"); }
+
+  // Zeitstempel der DB: "YYMMDDHHMM" (Ortszeit)
+  function parseTs(v) {
+    if (!v || v.length < 10) return null;
+    const d = new Date(2000 + +v.slice(0, 2), +v.slice(2, 4) - 1, +v.slice(4, 6), +v.slice(6, 8), +v.slice(8, 10));
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  // Stundenfenster ("YYMMDD", "HH"), die das Zeitintervall abdecken
+  function hourSlots(from, to) {
+    const out = [];
+    const d = new Date(from.getTime());
+    d.setMinutes(0, 0, 0);
+    while (d.getTime() <= to.getTime()) {
+      out.push({ date: pad2(d.getFullYear() % 100) + pad2(d.getMonth() + 1) + pad2(d.getDate()), hour: pad2(d.getHours()) });
+      d.setHours(d.getHours() + 1);
+    }
+    return out;
+  }
+
+  function norm(s) { return String(s || "").toLowerCase().replace(/\s+/g, ""); }
 
   function updateClock() {
     el.clock.textContent = new Date().toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
@@ -354,230 +434,276 @@
   updateClock();
   setInterval(updateClock, 1000);
 
+  // ---------- Zugangsdaten ----------
+
+  function getConfig() {
+    return { id: store("db.id") || "", key: store("db.key") || "", proxy: store("db.proxy") || DEFAULT_PROXY };
+  }
+  function hasCreds() { const c = getConfig(); return !!(c.id && c.key); }
+
   // ---------- Netzwerk ----------
 
-  async function fetchOnce(url, timeoutMs) {
+  class ApiError extends Error {
+    constructor(msg, kind, status) { super(msg); this.kind = kind; this.status = status; }
+  }
+
+  async function api(path, cfg, timeoutMs) {
+    cfg = cfg || getConfig();
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), timeoutMs || 10000);
     try {
-      const res = await fetch(url, { signal: controller.signal, mode: "cors", cache: "no-store" });
+      const res = await fetch(cfg.proxy + "/tt" + path, {
+        signal: controller.signal, mode: "cors", cache: "no-store",
+        headers: { "X-DB-Client-Id": cfg.id, "X-DB-Api-Key": cfg.key }
+      });
+      const text = await res.text();
       if (!res.ok) {
-        let detail = "";
-        try { detail = (await res.text()).slice(0, 200); } catch (e) {}
-        if (detail.includes("OPS_BLOCKED")) {
-          throw new Error("bahn.de hat zu viele Anfragen kurzzeitig blockiert. Das legt sich meist nach ein paar Minuten von selbst – einfach gleich nochmal versuchen.");
+        if (res.status === 401 || res.status === 403) {
+          throw new ApiError("Die DB hat die Zugangsdaten abgelehnt. Bitte Client-ID und API-Key prüfen und ob die API „Timetables“ für die Anwendung abonniert ist.", "auth", res.status);
         }
-        throw new Error("Proxy-Fehler " + res.status + (detail ? " – " + detail : ""));
+        if (res.status === 429) throw new ApiError("Zu viele Anfragen an die DB-API – bitte kurz warten.", "rate", 429);
+        throw new ApiError("DB-API-Fehler " + res.status + (text ? " – " + text.slice(0, 150) : ""), "http", res.status);
       }
-      return await res.json();
+      return text;
     } catch (err) {
-      if (err.name === "AbortError") throw new Error("Zeitüberschreitung – keine Antwort vom Proxy.");
-      if (err instanceof TypeError) throw new Error("Keine Verbindung zum Proxy.");
-      throw err;
+      if (err instanceof ApiError) throw err;
+      if (err && err.name === "AbortError") throw new ApiError("Zeitüberschreitung – keine Antwort.", "timeout");
+      throw new ApiError("Keine Verbindung zum Proxy.", "net");
     } finally {
       clearTimeout(timer);
     }
   }
 
-  // ---------- Hilfsfunktionen für bahn.de ----------
-
-  function pad2(n) { return String(n).padStart(2, "0"); }
-  function localDatum(d) { return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()); }
-  function localZeit(d) { return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds()); }
-
-  // ---------- bahn.de über eigenen Proxy (primäre Quelle, falls konfiguriert) ----------
-
-  async function resolveStationBahnDe(proxyBase, station) {
-    const cacheKey = "bahndeId:" + station.key;
-    const cached = localStorage.getItem(cacheKey);
-    if (cached) {
-      station.bahnde = JSON.parse(cached);
-      return;
+  function parseXml(text) {
+    const doc = new DOMParser().parseFromString(text, "text/xml");
+    if (doc.getElementsByTagName("parsererror").length || !doc.documentElement) {
+      throw new ApiError("Unerwartete Antwort der DB-API.", "parse");
     }
-    const path = `/web/api/reiseloesung/orte?suchbegriff=${encodeURIComponent(station.query)}&typ=ALL&limit=6`;
-    const data = await fetchOnce(proxyBase + path, 8000);
-    const arr = Array.isArray(data) ? data : (data.orte || data.results || Object.values(data).find(v => Array.isArray(v)) || []);
-    if (!arr || !arr.length) throw new Error("bahn.de (Proxy): Station nicht gefunden – " + station.label);
-
-    let best = null, bestDist = Infinity;
-    for (const s of arr) {
-      const lat = s.lat ?? s.latitude ?? (s.coordinates && s.coordinates.lat);
-      const lon = s.lon ?? s.lng ?? s.longitude ?? (s.coordinates && s.coordinates.lng);
-      if (lat == null || lon == null) continue;
-      const d = haversine(station.lat, station.lon, lat, lon);
-      if (d < bestDist) { bestDist = d; best = s; }
-    }
-    if (!best) best = arr[0];
-
-    const extId = best.extId || best.evaNr || best.ortExtId;
-    const ortId = best.id || best.ortId;
-    if (!extId || !ortId) {
-      throw new Error("bahn.de (Proxy): Unerwartetes Antwortformat bei der Stationssuche.\n" + JSON.stringify(best).slice(0, 300));
-    }
-    station.bahnde = { extId: String(extId), ortId: String(ortId), name: best.name || station.label };
-    localStorage.setItem(cacheKey, JSON.stringify(station.bahnde));
+    return doc;
   }
 
-  async function fetchBoardBatch(proxyBase, board, station, when, maxVias) {
-    const path = `/web/api/reiseloesung/${board}?datum=${localDatum(when)}&zeit=${encodeURIComponent(localZeit(when))}` +
-      `&ortExtId=${encodeURIComponent(station.bahnde.extId)}&ortId=${encodeURIComponent(station.bahnde.ortId)}` +
-      `&mitVias=true&maxVias=${maxVias}`;
-    const data = await fetchOnce(proxyBase + path, 8000);
-    const arr = Array.isArray(data) ? data : (data.entries || data.abfahrten || data.ankuenfte || Object.values(data).find(v => Array.isArray(v)) || null);
-    if (!Array.isArray(arr)) {
-      throw new Error("Unerwartetes Antwortformat (" + board + ").\n" + JSON.stringify(data).slice(0, 300));
+  // Prüft, ob der Worker bereits in Version 3 läuft.
+  async function checkProxy(proxy) {
+    let info = null;
+    try {
+      const res = await fetch(proxy + "/", { mode: "cors", cache: "no-store" });
+      info = await res.json();
+    } catch (e) {
+      throw new ApiError("Keine Verbindung zum Proxy. Adresse prüfen.", "net");
     }
-    return arr;
+    if (!info || !(info.version >= 3)) {
+      throw new ApiError("Der Proxy ist noch auf dem alten Stand. Bitte die neue worker.js in Cloudflare einfügen und „Deploy“ klicken.", "proxy");
+    }
   }
 
-  // Der Endpunkt liefert pro Aufruf nur eine begrenzte Anzahl an Einträgen über ALLE
-  // Richtungen. Damit das Zeitfenster schnell abgedeckt ist, werden mehrere Startzeiten
-  // GLEICHZEITIG abgefragt (statt nacheinander). Bei dichtem Takt entstehende Lücken werden
-  // in weiteren Runden geschlossen. Die typische Zeitspanne eines Aufrufs wird gemerkt,
-  // damit beim nächsten Mal nur so viele Abrufe wie nötig gemacht werden.
-  // Fragt NACHEINANDER ab (nicht parallel) – bahn.de blockiert bei zu vielen
-  // gleichzeitigen Anfragen (Fehler "OPS_BLOCKED"). Die Startzeit wird jeweils bis
-  // kurz hinter die letzte erhaltene Zeile vorgeschoben, bis das Fenster abgedeckt ist.
-  async function collectBoard(proxyBase, board, station, start, end, opts) {
-    const seen = new Map();
-    let cursor = start.getTime();
-    const endMs = end.getTime();
-    let okCount = 0, firstError = null;
+  // ---------- Fahrplandaten ----------
 
-    for (let i = 0; i < 12 && cursor < endMs; i++) {
-      let batch;
+  function attrs(node) {
+    const o = {};
+    if (!node) return null;
+    for (let i = 0; i < node.attributes.length; i++) o[node.attributes[i].name] = node.attributes[i].value;
+    return o;
+  }
+
+  // Liest <s>-Elemente (Haltestellenereignisse) aus Plan- oder Änderungs-XML.
+  function parseStops(doc) {
+    const out = [];
+    const nodes = doc.getElementsByTagName("s");
+    for (let i = 0; i < nodes.length; i++) {
+      const s = nodes[i];
+      const id = s.getAttribute("id");
+      if (!id) continue;
+      let tl = null, ar = null, dp = null;
+      for (let c = s.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType !== 1) continue;
+        if (c.nodeName === "tl") tl = c;
+        else if (c.nodeName === "ar") ar = c;
+        else if (c.nodeName === "dp") dp = c;
+      }
+      out.push({
+        id,
+        tripKey: id.replace(/-\d+$/, ""),   // Fahrt-ID + Starttermin, gleich an allen Halten einer Fahrt
+        cat: tl ? tl.getAttribute("c") || "" : "",
+        num: tl ? tl.getAttribute("n") || "" : "",
+        ar: attrs(ar),
+        dp: attrs(dp)
+      });
+    }
+    return out;
+  }
+
+  // Plan (Soll) und Änderungen (Ist) zusammenführen
+  function mergeStops(planStops, changeStops) {
+    const byId = new Map();
+    for (const s of planStops) {
+      const prev = byId.get(s.id);
+      byId.set(s.id, prev ? Object.assign(prev, { ar: s.ar || prev.ar, dp: s.dp || prev.dp }) :
+        { id: s.id, tripKey: s.tripKey, cat: s.cat, num: s.num, ar: s.ar ? Object.assign({}, s.ar) : null, dp: s.dp ? Object.assign({}, s.dp) : null });
+    }
+    for (const c of changeStops) {
+      let m = byId.get(c.id);
+      if (!m) {
+        if (!c.ar && !c.dp) continue;     // neu hinzugekommene Fahrt
+        m = { id: c.id, tripKey: c.tripKey, cat: c.cat, num: c.num, ar: null, dp: null };
+        byId.set(c.id, m);
+      }
+      if (!m.cat && c.cat) { m.cat = c.cat; m.num = c.num; }
+      if (c.ar) m.ar = Object.assign(m.ar || {}, c.ar);
+      if (c.dp) m.dp = Object.assign(m.dp || {}, c.dp);
+    }
+    return Array.from(byId.values());
+  }
+
+  function lineLabel(s) {
+    const l = (s.dp && s.dp.l) || (s.ar && s.ar.l) || "";
+    const cat = s.cat || "";
+    if (l) {
+      if (cat && norm(l).startsWith(norm(cat))) return l;
+      return cat + (cat.length > 2 ? " " : "") + l;
+    }
+    return ((cat + " " + s.num).trim()) || "?";
+  }
+
+  const planCache = new Map();   // "eva/datum/stunde" -> { at, promise }
+  const chgCache = new Map();    // eva -> { at, promise }
+
+  function cached(map, key, ttl, make) {
+    const c = map.get(key);
+    if (c && Date.now() - c.at < ttl) return c.promise;
+    const promise = make();
+    const entry = { at: Date.now(), promise };
+    map.set(key, entry);
+    promise.catch(() => { if (map.get(key) === entry) map.delete(key); });
+    return promise;
+  }
+
+  function getPlan(eva, slot) {
+    return cached(planCache, eva + "/" + slot.date + "/" + slot.hour, PLAN_TTL, () =>
+      api("/plan/" + eva + "/" + slot.date + "/" + slot.hour)
+        .then(t => parseStops(parseXml(t)))
+        .catch(err => { if (err.status === 404) return []; throw err; }));
+  }
+
+  function getChanges(eva) {
+    return cached(chgCache, eva, CHG_TTL, () =>
+      api("/fchg/" + eva)
+        .then(t => parseStops(parseXml(t)))
+        .catch(err => { if (err.status === 404) return []; throw err; }));
+  }
+
+  async function loadStops(eva, from, to) {
+    const slots = hourSlots(from, to);
+    const parts = await Promise.all(slots.map(s => getPlan(eva, s)).concat([getChanges(eva)]));
+    const changes = parts.pop();
+    return mergeStops([].concat.apply([], parts), changes);
+  }
+
+  async function resolveStation(st) {
+    if (st.eva) return;
+    const c = store("eva2:" + st.key);
+    if (c) {
       try {
-        batch = await fetchBoardBatch(proxyBase, board, station, new Date(cursor), opts.maxVias);
-        okCount++;
-      } catch (err) {
-        if (!firstError) firstError = err;
-        break;
-      }
-      if (!batch.length) break;
-
-      let lastTime = 0;
-      for (const item of batch) {
-        const key = item.journeyId || ((item.zeit || "") + "|" + (item.verkehrmittel && item.verkehrmittel.name));
-        if (!seen.has(key)) seen.set(key, item);
-        const t = new Date(item.zeit || item.ezZeit).getTime();
-        if (!isNaN(t) && t > lastTime) lastTime = t;
-      }
-      if (!lastTime || lastTime >= endMs) break;
-      cursor = lastTime + 60000;
+        const o = JSON.parse(c);
+        if (o && o.eva) { st.eva = o.eva; st.name = o.name || st.label; return; }
+      } catch (e) { /* neu auflösen */ }
     }
-
-    if (okCount === 0) throw firstError || new Error("Keine Daten erhalten.");
-    return seen;
+    let found = null;
+    for (const pattern of st.patterns) {
+      let list = [];
+      try {
+        const doc = parseXml(await api("/station/" + encodeURIComponent(pattern)));
+        const nodes = doc.getElementsByTagName("station");
+        for (let i = 0; i < nodes.length; i++) {
+          list.push({ eva: nodes[i].getAttribute("eva"), name: nodes[i].getAttribute("name") || "" });
+        }
+      } catch (e) {
+        if (e.kind !== "http") throw e;
+      }
+      list = list.filter(s => s.eva && norm(s.name).includes(norm(st.must)));
+      found = list.find(s => norm(s.name) === norm(st.exact)) || list[0] || null;
+      if (found) break;
+    }
+    if (!found && st.fallbackEva) found = { eva: st.fallbackEva, name: st.label };
+    if (!found) throw new ApiError("Station nicht gefunden: " + st.label, "http");
+    st.eva = found.eva;
+    st.name = found.name;
+    setStore("eva2:" + st.key, JSON.stringify({ eva: st.eva, name: st.name }));
   }
 
-  function trainKey(item) {
-    const vm = item.verkehrmittel || item.verkehrsmittel || {};
-    return (vm.name || "") + "|" + (vm.linienNummer || "");
-  }
-
-  async function fetchJourneysViaProxy(proxyBase, fromStation, toStation, onPartial, timing) {
-    const T0 = performance.now();
-    await Promise.all([
-      resolveStationBahnDe(proxyBase, fromStation),
-      resolveStationBahnDe(proxyBase, toStation)
-    ]);
+  async function fetchJourneys(fromStation, toStation, onPartial) {
+    await Promise.all([resolveStation(fromStation), resolveStation(toStation)]);
 
     const now = new Date();
     const windowEnd = new Date(now.getTime() + WINDOW_MIN * 60000);
     const windowStart = new Date(now.getTime() - PAST_MIN * 60000);
+    const targets = [norm(toStation.name), norm(toStation.label)];
 
-    // Abfahrten am Start und Ankünfte am Ziel parallel holen. Die Liste wird angezeigt,
+    // Abfahrten am Start und Ankünfte am Ziel gleichzeitig holen. Die Liste erscheint,
     // sobald die Abfahrten da sind; die Ankunftszeiten kommen danach dazu.
-    // Ein Fehler bei den Ankünften darf die Liste nicht verhindern.
-    const depPromise = collectBoard(proxyBase, "abfahrten", fromStation, windowStart, windowEnd, { maxVias: 20, defStepMin: 20 })
-      .then(m => { timing.dep = performance.now() - T0; return m; });
-    const arrPromise = collectBoard(proxyBase, "ankuenfte", toStation,
-                   new Date(windowStart.getTime() + 12 * 60000),
-                   new Date(windowEnd.getTime() + 60 * 60000), { maxVias: 3, defStepMin: 30 })
-      .then(m => { timing.arr = performance.now() - T0; return m; })
-      .catch(err => { console.warn("Ankunftstafel nicht verfügbar:", err); timing.arr = null; return new Map(); });
+    // (Verspätete Züge: Planzeit kann vor dem Fenster liegen, daher 20 Minuten früher beginnen.)
+    const depPromise = loadStops(fromStation.eva, new Date(windowStart.getTime() - 20 * 60000), windowEnd);
+    const arrPromise = loadStops(toStation.eva, new Date(windowStart.getTime() - 20 * 60000),
+      new Date(windowEnd.getTime() + ARR_EXTRA_MIN * 60000))
+      .catch(err => { console.warn("Ankünfte nicht verfügbar:", err); return []; });
+    arrPromise.catch(() => {});
 
-    const seen = await depPromise;
+    const depStops = await depPromise;
 
-    const targetNames = [
-      toStation.bahnde.name,
-      toStation.label,
-      toStation.label.replace(" (", "("),
-      toStation.label.replace(" (Saar)", "")
-    ].filter(Boolean);
-
-    // Baut die Liste; ohne Ankünfte (arrivals = null) zunächst ohne Ankunftszeit.
-    function build(arrivals) {
-      const arrivalsByTrain = new Map();
-      if (arrivals) {
-        for (const a of arrivals.values()) {
-          const k = trainKey(a);
-          if (!arrivalsByTrain.has(k)) arrivalsByTrain.set(k, []);
-          arrivalsByTrain.get(k).push(a);
+    function build(arrStops) {
+      const arrByTrip = new Map();
+      if (arrStops) {
+        for (const s of arrStops) {
+          if (!s.ar || s.ar.hi === "1") continue;
+          if (!arrByTrip.has(s.tripKey)) arrByTrip.set(s.tripKey, []);
+          arrByTrip.get(s.tripKey).push(s);
         }
       }
 
-      // Passende Ankunft zu einer Abfahrt: gleiche Zugnummer, planmäßige Ankunft
-      // nach der planmäßigen Abfahrt (frühester Treffer).
-      function findArrival(depItem, plannedDeparture) {
-        const list = arrivalsByTrain.get(trainKey(depItem));
-        if (!list) return null;
-        let best = null, bestT = Infinity;
-        for (const a of list) {
-          const planned = new Date(a.zeit);
-          if (isNaN(planned.getTime())) continue;
-          const diff = planned - plannedDeparture;
-          if (diff >= -60000 && diff < 6 * 3600000 && diff < bestT) { bestT = diff; best = a; }
-        }
-        if (!best) return null;
-        const plannedArr = new Date(best.zeit);
-        const realArr = new Date(best.ezZeit || best.zeit);
-        return {
-          arrival: isNaN(realArr.getTime()) ? plannedArr : realArr,
-          arrivalDelaySec: isNaN(realArr.getTime()) ? null : Math.round((realArr - plannedArr) / 1000)
-        };
-      }
+      const out = [];
+      for (const s of depStops) {
+        const dp = s.dp;
+        if (!dp || dp.hi === "1") continue;
+        const planned = parseTs(dp.pt) || parseTs(dp.ct);
+        if (!planned) continue;
 
-      const mapped = Array.from(seen.values())
-        .map(item => {
-          const raw = JSON.stringify(item);
-          if (!targetNames.some(n => raw.includes(n))) return null;
+        // Fährt der Zug über das Ziel? (geänderter Laufweg hat Vorrang)
+        const path = (dp.cpth || dp.ppth || "").split("|").map(norm);
+        if (!path.some(p => targets.includes(p))) continue;
 
-          const plannedRaw = item.zeit || item.plannedWhen || item.abfahrtszeit || item.planned;
-          const realRaw = item.ezZeit || item.ezAbfahrtszeit || item.realZeit || item.when || plannedRaw;
-          if (!plannedRaw) return null;
-          const plannedDeparture = new Date(plannedRaw);
-          const departure = new Date(realRaw || plannedRaw);
-          if (isNaN(departure.getTime())) return null;
+        const departure = parseTs(dp.ct) || planned;
+        const departureDelay = dp.ct ? Math.round((departure - planned) / 1000) : null;
+        const cancelled = dp.cs === "c";
 
-          let delaySec = null;
-          if (typeof item.verspaetung === "number") {
-            delaySec = item.verspaetung * 60;
-          } else if (!isNaN(plannedDeparture.getTime()) && !isNaN(departure.getTime())) {
-            delaySec = Math.round((departure - plannedDeparture) / 1000);
+        // Zugehörige Ankunft am Ziel: gleiche Fahrt, geplante Ankunft nach der geplanten Abfahrt
+        let arrival = null, arrivalDelaySec = null;
+        if (!cancelled) {
+          const list = arrByTrip.get(s.tripKey);
+          if (list) {
+            let best = null, bestDiff = Infinity;
+            for (const a of list) {
+              const pa = parseTs(a.ar.pt) || parseTs(a.ar.ct);
+              if (!pa) continue;
+              const diff = pa - planned;
+              if (diff > 0 && diff < bestDiff) { bestDiff = diff; best = a; }
+            }
+            if (best && best.ar.cs !== "c") {
+              const pa = parseTs(best.ar.pt) || parseTs(best.ar.ct);
+              const ra = parseTs(best.ar.ct) || pa;
+              arrival = ra;
+              arrivalDelaySec = best.ar.ct ? Math.round((ra - pa) / 1000) : null;
+            }
           }
+        }
 
-          const vm = item.verkehrmittel || item.verkehrsmittel || {};
-          const lineName = vm.mittelText || vm.linienNummer || vm.langText || vm.kurzText || item.linienbezeichnung || item.zugnummer || "?";
-          const platform = item.gleis || item.ezGleis || item.plattform || item.ezPlattform || null;
-          const cancelled = !!(item.cancelled || item.ausfall || item.canceled || item.storniert);
-          const arr = findArrival(item, isNaN(plannedDeparture.getTime()) ? departure : plannedDeparture);
+        out.push({
+          departure, plannedDeparture: planned, departureDelay,
+          platform: dp.cp || dp.pp || null,
+          cancelled, lineName: lineLabel(s),
+          arrival, arrivalDelaySec
+        });
+      }
 
-          return {
-            departure,
-            plannedDeparture: isNaN(plannedDeparture.getTime()) ? departure : plannedDeparture,
-            departureDelay: delaySec,
-            platform,
-            cancelled,
-            lineName,
-            arrival: arr ? arr.arrival : null,
-            arrivalDelaySec: arr ? arr.arrivalDelaySec : null,
-            transfers: 0
-          };
-        })
-        .filter(Boolean);
-
-      return mapped
+      return out
         .filter(j => j.departure >= windowStart && j.departure <= windowEnd)
         // bereits abgefahrene Züge nur, solange sie noch nicht am Ziel angekommen sind
         .filter(j => !(j.arrival && j.arrival < new Date(now.getTime() - 60000)))
@@ -590,8 +716,7 @@
 
   // ---------- Daten je Richtung (mit kurzem Zwischenspeicher) ----------
 
-  const FRESH_MS = 60000;   // so lange gelten geladene Daten für einen sofortigen Richtungswechsel
-  const dirData = {};       // Richtung -> { journeys, at, timing }
+  const dirData = {};       // Richtung -> { journeys, at }
   const dirPending = {};    // Richtung -> { promise, listeners }
 
   function pairFor(dir) {
@@ -605,8 +730,8 @@
     return !!d && Date.now() - d.at < FRESH_MS;
   }
 
-  // Liefert die Daten einer Richtung: aus dem Zwischenspeicher, von einem bereits laufenden
-  // Abruf oder per neuem Abruf. onPartial bekommt vorab die Liste ohne Ankunftszeiten.
+  // Liefert die Daten einer Richtung: aus dem Zwischenspeicher, von einem laufenden Abruf
+  // oder per neuem Abruf. onPartial bekommt vorab die Liste ohne Ankunftszeiten.
   function fetchDir(dir, force, onPartial) {
     if (!force && isFresh(dir)) return Promise.resolve(dirData[dir]);
     let entry = dirPending[dir];
@@ -616,9 +741,8 @@
     }
     entry = { listeners: onPartial ? [onPartial] : [] };
     const { from, to } = pairFor(dir);
-    const timing = {};
-    entry.promise = fetchJourneysViaProxy(PROXY_BASE, from, to, j => entry.listeners.forEach(fn => fn(j)), timing)
-      .then(journeys => { const d = { journeys, at: Date.now(), timing }; dirData[dir] = d; return d; })
+    entry.promise = fetchJourneys(from, to, j => entry.listeners.forEach(fn => fn(j)))
+      .then(journeys => { const d = { journeys, at: Date.now() }; dirData[dir] = d; return d; })
       .finally(() => { if (dirPending[dir] === entry) delete dirPending[dir]; });
     dirPending[dir] = entry;
     return entry.promise;
@@ -672,8 +796,7 @@
       }
 
       const arrLate = typeof j.arrivalDelaySec === "number" && j.arrivalDelaySec >= 60;
-      const subText = (j.arrival ? "an " + fmtTime(j.arrival) : (arrivalsPending ? "an …" : "")) +
-        (j.transfers > 0 ? (j.arrival ? " · " : "") + j.transfers + "x umsteigen" : "");
+      const subText = j.arrival ? "an " + fmtTime(j.arrival) : (arrivalsPending && !j.cancelled ? "an …" : "");
 
       row.innerHTML = `
         <div class="row-time">
@@ -681,28 +804,82 @@
           ${showPlanned ? `<span class="planned">${fmtTime(j.plannedDeparture)}</span>` : ""}
         </div>
         <div class="row-mid">
-          <div class="row-line">${j.lineName}</div>
+          <div class="row-line">${esc(j.lineName)}</div>
           ${subText ? `<div class="row-sub${arrLate ? " late" : ""}">${subText}</div>` : ""}
         </div>
         <div class="row-right">
           ${delayHtml}
-          ${j.platform ? `<div class="platform">Gleis ${j.platform}</div>` : ""}
+          ${j.platform ? `<div class="platform">Gleis ${esc(j.platform)}</div>` : ""}
         </div>
       `;
       el.list.appendChild(row);
     }
   }
 
-  // ---------- Hauptablauf ----------
+  // ---------- Einrichtung ----------
 
-  function currentPair() {
-    return direction === "sb-dl"
-      ? { from: STATIONS.sb, to: STATIONS.dl }
-      : { from: STATIONS.dl, to: STATIONS.sb };
+  function setMsg(text, isErr) {
+    el.setupMsg.textContent = text || "";
+    el.setupMsg.className = "setup-msg" + (isErr ? " err" : "");
   }
 
+  function showSetup(canCancel, msg) {
+    const c = getConfig();
+    el.cfgId.value = c.id;
+    el.cfgKey.value = c.key;
+    el.cfgProxy.value = c.proxy;
+    el.cfgCancel.hidden = !canCancel;
+    setMsg(msg || "", !!msg);
+    el.setup.hidden = false;
+    el.list.hidden = true;
+    el.controls.hidden = true;
+    el.statusText.textContent = "";
+    setupOpen = true;
+  }
+
+  function hideSetup() {
+    el.setup.hidden = true;
+    el.list.hidden = false;
+    el.controls.hidden = false;
+    setupOpen = false;
+  }
+
+  async function saveSetup() {
+    const cfg = {
+      id: el.cfgId.value.trim(),
+      key: el.cfgKey.value.trim(),
+      proxy: (el.cfgProxy.value.trim().replace(/\/+$/, "")) || DEFAULT_PROXY
+    };
+    if (!cfg.id || !cfg.key) { setMsg("Bitte Client-ID und API-Key eintragen.", true); return; }
+    el.cfgSave.disabled = true;
+    setMsg("Prüfe Zugangsdaten …", false);
+    try {
+      await checkProxy(cfg.proxy);
+      // Live-Änderungen werden nie zwischengespeichert – so wird wirklich die Anmeldung geprüft.
+      try {
+        const doc = parseXml(await api("/fchg/" + STATIONS.sb.fallbackEva, cfg, 12000));
+        if (doc.documentElement.nodeName !== "timetable") throw new ApiError("Unerwartete Antwort der DB-API.", "parse");
+      } catch (err) {
+        if (err.status !== 404) throw err;   // 404 = angemeldet, aber gerade keine Änderungen
+      }
+    } catch (err) {
+      setMsg(err.message || "Prüfung fehlgeschlagen.", true);
+      el.cfgSave.disabled = false;
+      return;
+    }
+    setStore("db.id", cfg.id);
+    setStore("db.key", cfg.key);
+    setStore("db.proxy", cfg.proxy);
+    el.cfgSave.disabled = false;
+    hideSetup();
+    start();
+  }
+
+  // ---------- Hauptablauf ----------
+
+  function currentPair() { return pairFor(direction); }
+
   let geoPending = false;   // Standort wird gerade bestimmt
-  let geoMs = null;         // Dauer der letzten Standortbestimmung
   let manualAt = 0;         // Zeitpunkt der letzten manuellen Richtungswahl
   let shown = null;         // aktuell angezeigte Daten (für die Statuszeile)
 
@@ -714,16 +891,9 @@
     el.autoBadgeText.textContent = geoPending ? "Standort …" : (autoMode ? "Standort" : "manuell");
   }
 
-  function fmtSecs(ms) { return (ms / 1000).toFixed(1).replace(".", ",") + "s"; }
-
   function refreshStatus() {
     if (!shown) return;
-    const t = shown.timing || {};
-    const parts = ["Stand " + new Date(shown.at).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" })];
-    if (typeof t.dep === "number") parts.push("Ab " + fmtSecs(t.dep));
-    if (typeof t.arr === "number") parts.push("An " + fmtSecs(t.arr));
-    if (geoMs !== null) parts.push("Ort " + fmtSecs(geoMs));
-    el.statusText.textContent = parts.join(" · ");
+    el.statusText.textContent = "Stand " + fmtTime(new Date(shown.at));
   }
 
   function showData(d) {
@@ -735,6 +905,7 @@
   let loadSeq = 0;
   // force=true: immer neu abrufen. force=false: frische Daten aus dem Zwischenspeicher nutzen.
   async function load(force) {
+    if (setupOpen) return;
     const mySeq = ++loadSeq;
     const dir = direction;
     updateHeader();
@@ -753,7 +924,8 @@
       showData(d);
     } catch (err) {
       if (mySeq !== loadSeq) return;
-      renderError(err.message || "Unbekannter Fehler.", () => load(true));
+      if (err && err.kind === "auth") { showSetup(true, err.message); return; }
+      renderError((err && err.message) || "Unbekannter Fehler.", () => load(true));
       el.statusText.textContent = "Fehler";
       console.error(err);
     }
@@ -765,20 +937,17 @@
     direction = dir;
     autoMode = !!isAuto;
     if (!isAuto) manualAt = Date.now();
-    localStorage.setItem("direction", direction);
+    setStore("direction", direction);
     load(false);
   }
 
   // ---------- Geolocation ----------
 
   // Bestimmt die Richtung per Standort. Die Daten werden NICHT darauf gewartet, sondern
-  // schon vorher geladen. Ergibt der Standort eine andere Richtung, wird sofort umgeschaltet
-  // (die Gegenrichtung ist dann meist schon vorgeladen).
+  // schon vorher geladen. Ergibt der Standort eine andere Richtung, wird sofort umgeschaltet.
   function locate() {
     const startedAt = Date.now();
-    const tg = performance.now();
     geoPending = true;
-    geoMs = null;
     el.locateBtn.textContent = "📍 …";
     updateHeader();
 
@@ -796,11 +965,9 @@
 
     navigator.geolocation.getCurrentPosition(
       pos => {
-        geoMs = performance.now() - tg;
         finish();
         if (manualAt > startedAt) {          // in der Zwischenzeit manuell gewählt: respektieren
           updateHeader();
-          refreshStatus();
           return;
         }
         const { latitude, longitude } = pos.coords;
@@ -810,9 +977,9 @@
         const changed = dir !== direction;
         direction = dir;
         autoMode = true;
-        localStorage.setItem("direction", direction);
+        setStore("direction", direction);
         if (changed) load(false);
-        else { updateHeader(); refreshStatus(); }
+        else updateHeader();
       },
       err => {
         finish();
@@ -824,26 +991,25 @@
     );
   }
 
-  // Beim Öffnen: laden und Standort parallel bestimmen.
-  // (Die Gegenrichtung wird NICHT mehr vorgeladen – das hat zusammen mit den parallelen
-  // Tafel-Abfragen zu viele gleichzeitige Anfragen an bahn.de erzeugt und wurde blockiert.)
+  // Beim Öffnen: laden und Standort parallel bestimmen. Ohne Zugangsdaten: Einrichtung.
   let lastStartAt = 0;
   function start() {
     lastStartAt = Date.now();
+    if (!hasCreds()) { showSetup(false); updateHeader(); return; }
     load(true);
     locate();
   }
 
   // ---------- Events ----------
 
-  el.swapBtn.addEventListener("click", () => {
-    setDirection(otherDir(direction), false);
-  });
-
+  el.swapBtn.addEventListener("click", () => setDirection(otherDir(direction), false));
   el.locateBtn.addEventListener("click", locate);
+  el.gearBtn.addEventListener("click", () => showSetup(true));
+  el.cfgSave.addEventListener("click", saveSetup);
+  el.cfgCancel.addEventListener("click", () => { hideSetup(); load(false); });
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && Date.now() - lastStartAt > 3000) {
+    if (document.visibilityState === "visible" && !setupOpen && Date.now() - lastStartAt > 3000) {
       start();
     }
   });
@@ -864,7 +1030,7 @@
       icons: [{ src: icon, sizes: "192x192 512x512", type: "image/svg+xml" }]
     };
     const blob = new Blob([JSON.stringify(manifest)], { type: "application/json" });
-    document.getElementById("manifestLink").href = URL.createObjectURL(blob);
+    $("manifestLink").href = URL.createObjectURL(blob);
   } catch (e) { /* nicht kritisch */ }
 
   // ---------- Start ----------
